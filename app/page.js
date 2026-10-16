@@ -87,18 +87,6 @@ export default function HomePage() {
 
   return (
     <div className="space-y-8">
-      {/* Dev preview banner if using starter data */}
-      {usingStarterData && (
-        <div className="bg-amber-50 border border-amber-200 rounded-xl p-3.5 flex items-center justify-between text-xs text-amber-800">
-          <div className="flex items-center gap-2">
-            <span className="font-semibold uppercase tracking-wider bg-amber-200 px-2 py-0.5 rounded text-[10px]">
-              Local / Starter Mode
-            </span>
-            <span>Displaying default college sports dataset. Connect your Supabase project in <code className="bg-amber-100 px-1 py-0.5 rounded">.env.local</code> to synchronize with the live database.</span>
-          </div>
-        </div>
-      )}
-
       {/* Hero Section */}
       <section className="bg-gradient-to-br from-brand-900 via-brand-800 to-indigo-950 rounded-3xl p-6 sm:p-10 text-white shadow-xl relative overflow-hidden">
         <div className="absolute right-0 bottom-0 opacity-10 pointer-events-none transform translate-x-12 translate-y-12">
