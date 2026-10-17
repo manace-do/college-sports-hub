@@ -1,12 +1,12 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { supabase, isSupabaseConfigured, getLocalUsers, saveLocalUsers } from '../../lib/supabaseClient';
+import { supabase, isSupabaseConfigured, getLocalUsers, saveLocalUsers, checkRegistrationExists } from '../../lib/supabaseClient';
 import { registerLocalCredentials } from '../../lib/authUtils';
 import { useAuth } from '../../lib/auth';
-import { Trophy, UserPlus, GraduationCap, Building2, Calendar, Mail, Lock, Heart, Check } from 'lucide-react';
+import { Trophy, UserPlus, GraduationCap, Building2, Calendar, Mail, Lock, Heart, Check, AlertCircle, Clock, ArrowRight } from 'lucide-react';
 
 export default function SignupPage() {
   const router = useRouter();
@@ -23,7 +23,28 @@ export default function SignupPage() {
 
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
+  const [isRateLimited, setIsRateLimited] = useState(false);
+  const [cooldownSeconds, setCooldownSeconds] = useState(0);
+  const [emailVerificationNotice, setEmailVerificationNotice] = useState(null);
   const [successMsg, setSuccessMsg] = useState(false);
+
+  // Synchronous submission lock to physically block rapid concurrent taps
+  const isSubmittingRef = useRef(false);
+
+  // Cooldown countdown timer when rate-limited
+  useEffect(() => {
+    if (cooldownSeconds <= 0) return;
+    const interval = setInterval(() => {
+      setCooldownSeconds((prev) => {
+        if (prev <= 1) {
+          clearInterval(interval);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [cooldownSeconds]);
 
   const branches = [
     { code: 'CSE', label: 'Computer Science (CSE)' },
@@ -60,8 +81,16 @@ export default function SignupPage() {
 
   const handleSignup = async (e) => {
     e.preventDefault();
+
+    // Prevent concurrent duplicate submissions
+    if (isSubmittingRef.current || loading || cooldownSeconds > 0) {
+      return;
+    }
+    isSubmittingRef.current = true;
     setLoading(true);
     setErrorMsg(null);
+    setIsRateLimited(false);
+    setEmailVerificationNotice(null);
 
     const cleanUsn = usn.trim().toUpperCase();
     const cleanEmail = personalEmail.trim().toLowerCase();
@@ -69,18 +98,21 @@ export default function SignupPage() {
     if (!cleanUsn) {
       setErrorMsg('Please enter your College USN / Roll Number.');
       setLoading(false);
+      isSubmittingRef.current = false;
       return;
     }
 
     if (!cleanEmail || !cleanEmail.includes('@')) {
       setErrorMsg('Please enter a valid Personal Email address.');
       setLoading(false);
+      isSubmittingRef.current = false;
       return;
     }
 
     if (password.length < 6) {
       setErrorMsg('Password must be at least 6 characters long.');
       setLoading(false);
+      isSubmittingRef.current = false;
       return;
     }
 
@@ -88,6 +120,7 @@ export default function SignupPage() {
     if (isNaN(parsedYear) || parsedYear < 1 || parsedYear > 4) {
       setErrorMsg('Please select a valid undergraduate year (Year 1 to Year 4).');
       setLoading(false);
+      isSubmittingRef.current = false;
       return;
     }
 
@@ -98,6 +131,26 @@ export default function SignupPage() {
       .filter((item) => item.length > 0);
 
     const combinedInterests = Array.from(new Set([...selectedSports, ...customList]));
+
+    // Step 1: Pre-check duplicate USN / Email before triggering Supabase Auth
+    // This avoids calling signUp() for already-registered students and prevents burning email quota!
+    try {
+      const { usnExists, emailExists } = await checkRegistrationExists(cleanUsn, cleanEmail);
+      if (usnExists) {
+        setErrorMsg(`An account with College USN "${cleanUsn}" is already registered. Please proceed to the login page.`);
+        setLoading(false);
+        isSubmittingRef.current = false;
+        return;
+      }
+      if (emailExists) {
+        setErrorMsg(`An account with Personal Email "${cleanEmail}" is already registered. Please proceed to the login page.`);
+        setLoading(false);
+        isSubmittingRef.current = false;
+        return;
+      }
+    } catch (checkErr) {
+      // Non-blocking pre-check fallback: continue if pre-check RPC isn't reachable
+    }
 
     if (isSupabaseConfigured() && supabase) {
       try {
@@ -118,25 +171,58 @@ export default function SignupPage() {
         });
 
         if (error) {
-          setErrorMsg(error.message || 'Error creating account. Please try again.');
+          const rawMsg = (error.message || '').toLowerCase();
+          const isRateLimit =
+            rawMsg.includes('rate limit') ||
+            rawMsg.includes('over_email_send_rate_limit') ||
+            error.status === 429;
+
+          if (isRateLimit) {
+            setIsRateLimited(true);
+            setCooldownSeconds(60);
+            setErrorMsg(
+              'Email rate limit reached: Supabase limits verification email frequency to prevent abuse. Please wait a few minutes before trying again. If you already received a confirmation email, please check your inbox and spam folder.'
+            );
+          } else if (rawMsg.includes('user already registered') || rawMsg.includes('already exists')) {
+            setErrorMsg(`An account with Personal Email "${cleanEmail}" is already registered. Please log in.`);
+          } else {
+            setErrorMsg(error.message || 'Error creating account. Please try again.');
+          }
+
           setLoading(false);
+          isSubmittingRef.current = false;
           return;
         }
 
-        // Save academic details into users profile table
+        // Check if Supabase requires email verification (data.user exists but data.session is null)
+        if (data?.user && !data?.session) {
+          setEmailVerificationNotice({
+            email: cleanEmail,
+            usn: cleanUsn,
+          });
+          setLoading(false);
+          isSubmittingRef.current = false;
+          return;
+        }
+
+        // Auto-confirmed or existing session
         if (data?.user?.id) {
-          await supabase
-            .from('users')
-            .update({
-              name: name.trim(),
-              department: branch,
-              year: parsedYear,
-              usn: cleanUsn,
-              interests: combinedInterests,
-              email: cleanEmail,
-              college: 'Dr. A.C.S. College of Engineering (ACSCE)',
-            })
-            .eq('id', data.user.id);
+          try {
+            await supabase
+              .from('users')
+              .update({
+                name: name.trim(),
+                department: branch,
+                year: parsedYear,
+                usn: cleanUsn,
+                interests: combinedInterests,
+                email: cleanEmail,
+                college: 'Dr. A.C.S. College of Engineering (ACSCE)',
+              })
+              .eq('id', data.user.id);
+          } catch (updateErr) {
+            // Profile trigger handles initial insert
+          }
         }
 
         setSuccessMsg(true);
@@ -144,8 +230,9 @@ export default function SignupPage() {
           router.push('/profile');
         }, 1200);
       } catch (err) {
-        setErrorMsg('Network error. Please try again.');
+        setErrorMsg('Network connection error. Please verify your internet connection and try again.');
         setLoading(false);
+        isSubmittingRef.current = false;
       }
     } else {
       // Local / Starter simulation mode
@@ -159,6 +246,7 @@ export default function SignupPage() {
       if (existing) {
         setErrorMsg('An account with this USN or Personal Email is already registered. Please log in.');
         setLoading(false);
+        isSubmittingRef.current = false;
         return;
       }
 
@@ -171,7 +259,7 @@ export default function SignupPage() {
         year: parsedYear,
         college: 'Dr. A.C.S. College of Engineering (ACSCE)',
         interests: combinedInterests,
-        is_admin: false, // Strictly false: signing up never grants admin privileges!
+        is_admin: false,
         created_at: new Date().toISOString(),
       };
 
@@ -230,17 +318,66 @@ export default function SignupPage() {
           </span>
         </div>
 
+        {/* Informative Error Notice with Rate-Limit Awareness */}
         {errorMsg && (
-          <div className="p-3.5 rounded-2xl bg-red-50 border border-red-200 text-xs text-red-700 font-medium">
-            {errorMsg}
+          <div className="p-4 rounded-2xl bg-red-50 border border-red-200 text-xs text-red-800 space-y-2">
+            <div className="flex items-center gap-2 font-bold text-red-900">
+              <AlertCircle className="w-4 h-4 shrink-0 text-red-600" />
+              <span>{isRateLimited ? 'Email Rate Limit Reached' : 'Registration Alert'}</span>
+            </div>
+            <p className="leading-relaxed text-red-700">{errorMsg}</p>
+            {isRateLimited && (
+              <div className="pt-2 border-t border-red-200/60 flex items-center justify-between text-[11px] text-red-600">
+                <span className="flex items-center gap-1">
+                  <Clock className="w-3.5 h-3.5" />
+                  {cooldownSeconds > 0 ? `Please wait ${cooldownSeconds}s before re-submitting` : 'You may try again shortly.'}
+                </span>
+                <Link href="/login" className="font-bold underline hover:text-red-900">
+                  Go to Log In &rarr;
+                </Link>
+              </div>
+            )}
           </div>
         )}
 
-        {successMsg && (
-          <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 font-medium">
-            Account created successfully! Redirecting to your profile...
+        {/* Post-Signup Email Verification Notice */}
+        {emailVerificationNotice ? (
+          <div className="p-6 rounded-2xl bg-blue-50 border border-blue-200 text-center space-y-4">
+            <div className="w-12 h-12 rounded-2xl bg-blue-100 flex items-center justify-center text-blue-700 mx-auto">
+              <Mail className="w-6 h-6" />
+            </div>
+            <div className="space-y-1.5">
+              <h2 className="text-base font-bold text-slate-900">
+                Account Registered — Verify Your Email
+              </h2>
+              <p className="text-xs text-slate-600 max-w-sm mx-auto leading-relaxed">
+                A verification link has been sent to{' '}
+                <strong className="text-slate-900">{emailVerificationNotice.email}</strong>.
+              </p>
+            </div>
+            <div className="p-3.5 bg-white rounded-xl border border-blue-100 text-[11px] text-slate-600 text-left space-y-1">
+              <p className="font-bold text-slate-800">Next Steps:</p>
+              <ol className="list-decimal list-inside space-y-1 text-slate-500">
+                <li>Check your personal email inbox (and Spam/Junk folder).</li>
+                <li>Click the verification link to confirm your email.</li>
+                <li>Log in using your College USN (<strong>{emailVerificationNotice.usn}</strong>) or Personal Email.</li>
+              </ol>
+            </div>
+            <Link
+              href="/login"
+              className="inline-flex items-center justify-center w-full py-3 px-4 rounded-xl text-xs font-bold text-white bg-brand-600 hover:bg-brand-700 transition shadow-sm gap-1.5"
+            >
+              <span>Proceed to Log In</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </Link>
           </div>
-        )}
+        ) : (
+          <>
+            {successMsg && (
+              <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 font-medium">
+                Account created successfully! Redirecting to your profile...
+              </div>
+            )}
 
         <form onSubmit={handleSignup} className="space-y-4">
           {/* Full Name & USN in Grid */}
@@ -398,13 +535,21 @@ export default function SignupPage() {
 
           <button
             type="submit"
-            disabled={loading}
+            disabled={loading || cooldownSeconds > 0}
             className="w-full py-3.5 px-4 rounded-xl text-sm font-bold text-white bg-brand-600 hover:bg-brand-700 shadow-sm transition flex items-center justify-center gap-2 disabled:opacity-50 mt-2"
           >
             <UserPlus className="w-4 h-4" />
-            <span>{loading ? 'Creating Account...' : 'Sign Up as Student'}</span>
+            <span>
+              {loading
+                ? 'Creating Account...'
+                : cooldownSeconds > 0
+                ? `Please wait (${cooldownSeconds}s)`
+                : 'Sign Up as Student'}
+            </span>
           </button>
         </form>
+          </>
+        )}
 
         <div className="pt-4 border-t border-slate-100 text-center text-xs text-slate-500">
           Already registered?{' '}

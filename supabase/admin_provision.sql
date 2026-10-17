@@ -12,6 +12,8 @@
 -- 5. Promotes the account to primary administrator (is_admin = true).
 -- =====================================================================
 
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 DO $$
 DECLARE
   v_user_id uuid;
@@ -21,8 +23,12 @@ DECLARE
   -- The designated administrator password
   v_password text := 'tttuuuyyy010';
 BEGIN
-  -- 1. Check if the user already exists in auth.users
-  SELECT id INTO v_user_id FROM auth.users WHERE email = lower(v_email);
+  -- 1. Check if the user already exists in auth.users (by email OR by metadata USN)
+  SELECT id INTO v_user_id
+  FROM auth.users
+  WHERE lower(email) = lower(v_email)
+     OR upper(coalesce(raw_user_meta_data->>'usn', '')) = v_usn
+  LIMIT 1;
 
   IF v_user_id IS NOT NULL THEN
     -- Update existing auth account with new password and confirm email
@@ -39,7 +45,7 @@ BEGIN
       updated_at = now()
     WHERE id = v_user_id;
 
-    RAISE NOTICE 'Existing auth account % updated with new password and verified.', v_email;
+    RAISE NOTICE 'Existing auth account for USN % updated with new password and verified.', v_usn;
   ELSE
     -- Generate fresh UUID and insert into auth.users
     v_user_id := gen_random_uuid();
@@ -83,6 +89,7 @@ BEGIN
     id,
     name,
     usn,
+    email,
     department,
     year,
     interests,
@@ -92,6 +99,7 @@ BEGIN
     v_user_id,
     v_name,
     v_usn,
+    (SELECT email FROM auth.users WHERE id = v_user_id),
     'CSE',
     4,
     ARRAY['Football', 'Basketball', 'Athletics'],
@@ -102,6 +110,7 @@ BEGIN
   SET
     is_admin = true,
     usn = v_usn,
+    email = COALESCE(public.users.email, (SELECT email FROM auth.users WHERE id = v_user_id)),
     name = COALESCE(public.users.name, v_name),
     department = COALESCE(public.users.department, 'CSE'),
     year = COALESCE(public.users.year, 4),

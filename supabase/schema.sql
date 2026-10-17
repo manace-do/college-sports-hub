@@ -522,5 +522,38 @@ update site_settings
 set value = jsonb_set(value, '{tagline}', '"Dr. A.C.S. College of Engineering (ACSCE) Sports Portal"')
 where key = 'portal_config' and value->>'tagline' in ('Discover College Teams & Casual Games');
 
+-- =====================================================
+-- 14. REGISTRATION PRE-CHECK FUNCTION (Save Email Quota)
+-- =====================================================
+create or replace function public.check_registration_exists(p_usn text, p_email text)
+returns jsonb
+language plpgsql security definer set search_path = public, auth as $$
+declare
+  clean_usn text := upper(trim(coalesce(p_usn, '')));
+  clean_email text := lower(trim(coalesce(p_email, '')));
+  usn_found boolean := false;
+  email_found boolean := false;
+begin
+  if clean_usn <> '' then
+    select exists (
+      select 1 from public.users where upper(trim(coalesce(usn, ''))) = clean_usn
+      union
+      select 1 from auth.users where upper(trim(coalesce(raw_user_meta_data->>'usn', ''))) = clean_usn
+    ) into usn_found;
+  end if;
+
+  if clean_email <> '' then
+    select exists (
+      select 1 from public.users where lower(trim(coalesce(email, ''))) = clean_email
+      union
+      select 1 from auth.users where lower(trim(coalesce(email, ''))) = clean_email
+    ) into email_found;
+  end if;
+
+  return jsonb_build_object('usn_exists', usn_found, 'email_exists', email_found);
+end;
+$$;
+grant execute on function public.check_registration_exists(text, text) to anon, authenticated;
+
 
 
